@@ -7,6 +7,8 @@ from langchain_community.llms import Ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
+from rag import add_chunks, search
+
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -18,6 +20,11 @@ splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
 class ChatRequest(BaseModel):
     message: str
+
+
+class SearchRequest(BaseModel):
+    query: str
+    n_results: int = 3
 
 
 @app.get("/")
@@ -47,8 +54,9 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         documents = PyPDFLoader(temp_path).load()
         chunks = splitter.split_documents(documents)
+        stored = add_chunks(chunks, file.filename)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not process PDF: {exc}")
     finally:
         os.remove(temp_path)
 
@@ -56,5 +64,14 @@ async def upload_pdf(file: UploadFile = File(...)):
         "filename": file.filename,
         "pages": len(documents),
         "chunks": len(chunks),
+        "stored": stored,
         "preview": chunks[0].page_content[:200] if chunks else "",
+    }
+
+
+@app.post("/api/search")
+def search_documents(request: SearchRequest):
+    return {
+        "query": request.query,
+        "results": search(request.query, request.n_results),
     }
