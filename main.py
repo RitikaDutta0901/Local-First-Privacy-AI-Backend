@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -9,7 +10,7 @@ from langchain_community.llms import Ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
-from rag import add_chunks, search
+from rag import add_chunks, delete_document, list_documents, search
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -49,21 +50,31 @@ def build_prompt(question, context):
     )
 
 
-async def stream_answer(prompt):
+async def stream_answer(prompt, sources):
+    yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
     try:
         async for chunk in llm.astream(prompt):
-            yield f"data: {json.dumps({'token': chunk})}\n\n"
+            yield f"event: token\ndata: {json.dumps({'token': chunk})}\n\n"
     except Exception as exc:
-        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-    yield "data: [DONE]\n\n"
+        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+    yield "event: done\ndata: [DONE]\n\n"
 
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     context = search(request.message, request.n_results)
     prompt = build_prompt(request.message, context)
+    sources = [
+        {
+            "document_id": item["document_id"],
+            "source": item["source"],
+            "page": item["page"],
+            "distance": item["distance"],
+        }
+        for item in context
+    ]
     return StreamingResponse(
-        stream_answer(prompt),
+        stream_answer(prompt, sources),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
@@ -75,6 +86,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     contents = await file.read()
+    document_id = hashlib.sha256(contents).hexdigest()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(contents)
         temp_path = temp_file.name
@@ -82,7 +95,9 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         documents = PyPDFLoader(temp_path).load()
         chunks = splitter.split_documents(documents)
-        stored = add_chunks(chunks, file.filename)
+        stored, duplicate = add_chunks(
+            chunks, document_id, file.filename, len(contents)
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not process PDF: {exc}")
     finally:
@@ -90,11 +105,26 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     return {
         "filename": file.filename,
+        "document_id": document_id,
         "pages": len(documents),
         "chunks": len(chunks),
         "stored": stored,
+        "duplicate": duplicate,
         "preview": chunks[0].page_content[:200] if chunks else "",
     }
+
+
+@app.get("/api/documents")
+def get_documents():
+    documents = list_documents()
+    return {"count": len(documents), "documents": documents}
+
+
+@app.delete("/api/documents/{document_id}")
+def remove_document(document_id: str):
+    if not delete_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"deleted": document_id}
 
 
 @app.post("/api/search")
