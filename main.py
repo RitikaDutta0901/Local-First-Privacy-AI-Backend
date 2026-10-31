@@ -1,7 +1,9 @@
+import json
 import os
 import tempfile
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.llms import Ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -20,6 +22,7 @@ splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
 class ChatRequest(BaseModel):
     message: str
+    n_results: int = 3
 
 
 class SearchRequest(BaseModel):
@@ -32,13 +35,38 @@ def root():
     return {"status": "ok", "model": MODEL_NAME}
 
 
+def build_prompt(question, context):
+    if not context:
+        return question
+
+    context_text = "\n\n".join(item["content"] for item in context)
+    return (
+        "Answer the question using only the context below. "
+        "If the answer is not in the context, say you do not know.\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question: {question}\n\n"
+        "Answer:"
+    )
+
+
+async def stream_answer(prompt):
+    try:
+        async for chunk in llm.astream(prompt):
+            yield f"data: {json.dumps({'token': chunk})}\n\n"
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    try:
-        response = await llm.ainvoke(request.message)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama error: {exc}")
-    return {"response": response}
+    context = search(request.message, request.n_results)
+    prompt = build_prompt(request.message, context)
+    return StreamingResponse(
+        stream_answer(prompt),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/api/upload")
